@@ -3,3 +3,6 @@ __pycache__/
 *$py.class
 .pytest_cache/
 data/bin/
+data/proxies_active.json
+data/proxies_raw.txt
+data/exports/
