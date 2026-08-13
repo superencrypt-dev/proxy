@@ -1,0 +1,24 @@
+{
+  "sources": [
+    {
+      "name": "Free-V2Ray-All",
+      "url": "https://raw.githubusercontent.com/freefq/free/master/v2",
+      "type": "base64"
+    },
+    {
+      "name": "NodeFree-Daily",
+      "url": "https://raw.githubusercontent.com/v2ray-links/v2ray-free/master/README.md",
+      "type": "raw_extract"
+    },
+    {
+      "name": "Epodonios-Aggregator",
+      "url": "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
+      "type": "raw_lines"
+    },
+    {
+      "name": "Barry-Clash-Sub",
+      "url": "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/All_Configs_Sub.txt",
+      "type": "raw_lines"
+    }
+  ]
+}
