@@ -92,10 +92,20 @@ class TUIMenu:
                 pass
         return [
             {
-                "name": "Free-V2Ray-All",
-                "url": "https://raw.githubusercontent.com/freefq/free/master/v2",
-                "type": "base64",
-            }
+                "name": "EbraSha-All-Protocols",
+                "url": "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/main/V2Ray-Config-By-EbraSha-All-Type.txt",
+                "type": "raw_lines",
+            },
+            {
+                "name": "EbraSha-Curated-V2Ray",
+                "url": "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/main/V2Ray-Config-By-EbraSha.txt",
+                "type": "raw_lines",
+            },
+            {
+                "name": "EbraSha-Daily-Extract",
+                "url": "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/main/README.md",
+                "type": "raw_extract",
+            },
         ]
 
     def _save_sources(self, sources: List[Dict[str, Any]]) -> None:
