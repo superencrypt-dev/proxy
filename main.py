@@ -60,7 +60,7 @@ def main():
             interval = float(cfg.get("auto_update_interval_minutes", 60))
             menu.scheduler.start(
                 interval_minutes=interval,
-                task_callback=menu.handle_scrape_and_check_all,
+                task_callback=menu.handle_headless_update,
             )
 
         # Launch interactive menu loop if not headless

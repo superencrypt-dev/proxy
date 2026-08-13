@@ -1,11 +1,13 @@
-"""Interactive TUI Menu Component for Proxy Scraper & Checker (Strictly No Emoji)."""
+"""Interactive TUI Menu Component for Proxy Scraper & Checker (Strictly No Emoji).
+Refactored & Streamlined Architecture: Modular, DRY, Data-Safe, and Unified.
+"""
 
 import os
 import sys
 import json
 import time
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import questionary
 from rich.console import Console
 from rich.panel import Panel
@@ -38,6 +40,7 @@ class TUIMenu:
         self.runner = LocalProxyRunner()
         self.scheduler = AutoScheduler()
         self.exporter = ProxyExporter()
+        self.collector = ProxyCollector()
         self._ensure_directories()
 
     def _ensure_directories(self) -> None:
@@ -126,600 +129,847 @@ class TUIMenu:
 
     def _load_raw_proxies(self) -> List[ProxyNode]:
         """Load raw nodes from data/proxies_raw.txt."""
-        collector = ProxyCollector()
         if os.path.exists(RAW_PROXIES_FILE):
-            return collector.import_from_file(RAW_PROXIES_FILE)
+            return self.collector.import_from_file(RAW_PROXIES_FILE)
         return []
 
-    def _save_raw_proxies(self, nodes: List[ProxyNode]) -> None:
-        """Save raw nodes to data/proxies_raw.txt."""
+    def _save_raw_proxies(self, nodes: List[ProxyNode], merge_with_existing: bool = True) -> None:
+        """Save raw nodes to data/proxies_raw.txt with safe deduplicated merge."""
         try:
-            raw_uris = [n.raw_uri for n in nodes if n.raw_uri]
+            target_nodes = nodes
+            if merge_with_existing and os.path.exists(RAW_PROXIES_FILE):
+                existing = self._load_raw_proxies()
+                target_nodes = self.collector.deduplicate(existing + nodes)
+            else:
+                target_nodes = self.collector.deduplicate(nodes)
+
+            raw_uris = [n.raw_uri for n in target_nodes if n.raw_uri]
             with open(RAW_PROXIES_FILE, "w", encoding="utf-8") as f:
                 f.write("\n".join(raw_uris) + "\n")
         except Exception as e:
             self.views.render_status_panel("ERROR", f"Gagal menyimpan raw proxies: {e}", style="red")
 
-    def handle_scrape_and_check_all(self) -> List[ProxyNode]:
-        """One-click update: Scrape all sources, run health check, save active & raw, render summary."""
+    # =========================================================================
+    # CORE PIPELINE (DRY & UNIFIED HEALTH CHECKER)
+    # =========================================================================
+
+    def _run_health_check_pipeline(
+        self,
+        nodes: List[ProxyNode],
+        is_interactive: bool = True,
+        save_to_active: bool = True,
+    ) -> Tuple[List[ProxyNode], List[ProxyNode]]:
+        """Unified, reusable core health checker pipeline with progress reporting and saving."""
+        if not nodes:
+            if is_interactive:
+                self.views.render_status_panel("INFO", "Tidak ada node proxy yang diberikan untuk dicek.", style="yellow")
+            return [], []
+
+        cfg = self._load_config()
+        concurrency = int(cfg.get("concurrency", 30))
+        timeout = int(cfg.get("timeout", 5000))
+        test_url = cfg.get("test_url", "http://cp.cloudflare.com/generate_204")
+        backup_test_url = cfg.get("backup_test_url", "https://www.gstatic.com/generate_204")
+
+        # 1. Ensure sing-box binary is ready
+        try:
+            bm = BinaryManager()
+            bin_path = bm.ensure_singbox()
+        except Exception as e:
+            if is_interactive:
+                self.views.render_status_panel("ERROR", f"Gagal memverifikasi binary sing-box: {e}", style="red")
+            return [], []
+
+        checker = ProxyChecker(
+            concurrency=concurrency,
+            timeout=timeout,
+            test_url=test_url,
+            fallback_test_url=backup_test_url,
+            binary_path=bin_path,
+            enable_fast_ping=True,
+        )
+
+        start_time = time.time()
+        alive_nodes: List[ProxyNode] = []
+        dead_nodes: List[ProxyNode] = []
+
+        if is_interactive:
+            progress = self.views.create_progress_bar()
+            with progress:
+                task_id = progress.add_task(f"Memeriksa {len(nodes)} Proxy...", total=len(nodes))
+
+                def on_progress(completed: int, total: int, node: ProxyNode):
+                    progress.update(task_id, completed=completed)
+
+                alive_nodes, dead_nodes = asyncio.run(checker.check_nodes(nodes, on_progress=on_progress))
+        else:
+            alive_nodes, dead_nodes = asyncio.run(checker.check_nodes(nodes, on_progress=None))
+
+        duration = time.time() - start_time
+
+        # Sort alive nodes by latency ascending (fastest first)
+        alive_nodes.sort(key=lambda n: n.latency if n.latency > 0 else 999999)
+
+        if save_to_active:
+            self._save_active_proxies(alive_nodes)
+
+        if is_interactive:
+            self.views.render_summary(
+                total=len(nodes),
+                alive=len(alive_nodes),
+                dead=len(dead_nodes),
+                duration_sec=duration,
+            )
+
+        return alive_nodes, dead_nodes
+
+    # =========================================================================
+    # MENU 1: QUICK UPDATE (SAFE MERGE + CHECK ALL)
+    # =========================================================================
+
+    def handle_quick_update(self) -> List[ProxyNode]:
+        """Scrape all upstream sources, safely merge with existing raw proxies, and run health check."""
         self.views.render_banner()
         self.console.print("[bold cyan][1/3] Menyiapkan environment & binary sing-box...[/bold cyan]")
         try:
             bm = BinaryManager()
             bm.ensure_singbox()
         except Exception as e:
-            self.views.render_status_panel("ERROR", f"Gagal mengunduh/menyiapkan binary sing-box: {e}", style="red")
+            self.views.render_status_panel("ERROR", f"Gagal download binary sing-box: {e}", style="red")
             return []
 
         self.console.print("[bold cyan][2/3] Mengumpulkan proxy dari seluruh sumber upstream...[/bold cyan]")
         sources = self._load_sources()
-        collector = ProxyCollector()
+        fresh_nodes = asyncio.run(self.collector.fetch_all_sources(sources))
 
-        start_time = time.time()
-        raw_nodes = asyncio.run(collector.fetch_all_sources(sources))
-        self.console.print(f"[bold green]Berhasil mengumpulkan {len(raw_nodes)} raw node unik.[/bold green]")
-        self._save_raw_proxies(raw_nodes)
+        # Safe merge with existing raw proxies so manual imports are not lost
+        existing_raw = self._load_raw_proxies()
+        all_raw_nodes = self.collector.deduplicate(existing_raw + fresh_nodes)
+        self._save_raw_proxies(all_raw_nodes, merge_with_existing=False)
 
-        if not raw_nodes:
-            self.views.render_status_panel("WARNING", "Tidak ada proxy yang dapat diambil dari sumber upstream.", style="yellow")
-            return []
-
-        self.console.print(f"[bold cyan][3/3] Menjalankan health check ({len(raw_nodes)} nodes)...[/bold cyan]")
-        cfg = self._load_config()
-        checker = ProxyChecker(
-            concurrency=cfg.get("concurrency", 30),
-            timeout=cfg.get("timeout", 5000),
-            test_url=cfg.get("test_url", "http://cp.cloudflare.com/generate_204"),
-            fallback_test_url=cfg.get("backup_test_url", "https://www.gstatic.com/generate_204"),
+        self.console.print(
+            f"[green]Terkumpul {len(fresh_nodes)} node baru (Total database raw: {len(all_raw_nodes)} node unik).[/green]"
         )
 
-        progress = self.views.create_progress_bar()
-        alive_nodes: List[ProxyNode] = []
-        dead_nodes: List[ProxyNode] = []
-
-        with progress:
-            task_id = progress.add_task("Health Checking...", total=len(raw_nodes))
-
-            def on_prog(completed: int, total: int, last_node: ProxyNode):
-                progress.update(task_id, completed=completed)
-
-            alive_nodes, dead_nodes = asyncio.run(checker.check_nodes(raw_nodes, on_progress=on_prog))
-
-        duration = time.time() - start_time
-        alive_nodes.sort(key=lambda x: x.latency if x.latency > 0 else 999999)
-
-        self._save_active_proxies(alive_nodes)
-        self.views.render_summary(
-            total=len(raw_nodes),
-            alive=len(alive_nodes),
-            dead=len(dead_nodes),
-            duration_sec=duration,
-        )
+        self.console.print(f"[bold cyan][3/3] Menjalankan health check ({len(all_raw_nodes)} nodes)...[/bold cyan]")
+        alive_nodes, _ = self._run_health_check_pipeline(all_raw_nodes, is_interactive=True, save_to_active=True)
         return alive_nodes
 
-    def handle_collect_proxies(self) -> List[ProxyNode]:
-        """Sub-menu for proxy collection (Public sources, Custom URL, File import, Direct paste)."""
-        self.views.render_banner()
-        choice = questionary.select(
-            "Pilih Metode Pengumpulkan Proxy:",
-            choices=[
-                "[1] Scrape Publik Upstream Sources",
-                "[2] Input Custom URL Subscription",
-                "[3] Import File (TXT / JSON / YAML)",
-                "[4] Direct Paste Proxy Links",
-                "[0] Kembali ke Menu Utama",
-            ],
-        ).ask()
+    def handle_scrape_and_check_all(self) -> List[ProxyNode]:
+        """Alias for handle_quick_update for backward compatibility."""
+        return self.handle_quick_update()
 
-        if choice is None or choice.startswith("[0]"):
-            return []
-
-        collector = ProxyCollector()
-        existing_raw = self._load_raw_proxies()
-        new_nodes: List[ProxyNode] = []
-
-        if choice.startswith("[1]"):
-            sources = self._load_sources()
-            self.console.print("[bold cyan]Mengambil proxy dari sumber upstream...[/bold cyan]")
-            new_nodes = asyncio.run(collector.fetch_all_sources(sources))
-        elif choice.startswith("[2]"):
-            url = questionary.text("Masukkan URL Subscription / Proxy Link:").ask()
-            if url and url.strip():
-                self.console.print("[bold cyan]Mengambil proxy dari URL...[/bold cyan]")
-                new_nodes = asyncio.run(collector.fetch_from_source({"url": url.strip(), "name": "Custom"}))
-        elif choice.startswith("[3]"):
-            path = questionary.text("Masukkan Path File (.txt / .json / .yaml / .yml):").ask()
-            if path and path.strip() and os.path.exists(path.strip()):
-                self.console.print("[bold cyan]Membaca proxy dari file...[/bold cyan]")
-                new_nodes = collector.import_from_file(path.strip())
-            else:
-                self.views.render_status_panel("ERROR", f"File tidak ditemukan: {path}", style="red")
-                return []
-        elif choice.startswith("[4]"):
-            raw_text = questionary.text("Paste raw proxy links / text di sini:").ask()
-            if raw_text and raw_text.strip():
-                new_nodes = collector.import_from_text(raw_text.strip())
-
-        all_nodes = collector.deduplicate(existing_raw + new_nodes)
-        self._save_raw_proxies(all_nodes)
-        self.views.render_status_panel(
-            "PENGUMPULAN SUCCESS",
-            f"Ditemukan {len(new_nodes)} node baru. Total Raw Cache: {len(all_nodes)} node.",
-            style="green",
-        )
-        return all_nodes
-
-    def handle_health_check(self) -> List[ProxyNode]:
-        """Runs health check on raw/existing proxies and updates active list."""
-        self.views.render_banner()
-        raw_nodes = self._load_raw_proxies()
-        if not raw_nodes:
-            raw_nodes = self._load_active_proxies()
-
-        if not raw_nodes:
-            self.views.render_status_panel(
-                "WARNING", "Belum ada proxy raw/aktif. Silakan kumpulkan proxy terlebih dahulu.", style="yellow"
-            )
-            return []
-
+    def handle_headless_update(self) -> List[ProxyNode]:
+        """Silent update routine designed for background auto-scheduler and headless execution."""
         try:
             bm = BinaryManager()
             bm.ensure_singbox()
-        except Exception as e:
-            self.views.render_status_panel("ERROR", f"Gagal mengunduh/menyiapkan binary sing-box: {e}", style="red")
+            sources = self._load_sources()
+            fresh_nodes = asyncio.run(self.collector.fetch_all_sources(sources))
+            existing_raw = self._load_raw_proxies()
+            all_raw = self.collector.deduplicate(existing_raw + fresh_nodes)
+            self._save_raw_proxies(all_raw, merge_with_existing=False)
+            alive_nodes, _ = self._run_health_check_pipeline(all_raw, is_interactive=False, save_to_active=True)
+            return alive_nodes
+        except Exception:
             return []
 
-        self.console.print(f"[bold cyan]Menjalankan health check pada {len(raw_nodes)} node...[/bold cyan]")
-        cfg = self._load_config()
-        checker = ProxyChecker(
-            concurrency=cfg.get("concurrency", 30),
-            timeout=cfg.get("timeout", 5000),
-            test_url=cfg.get("test_url", "http://cp.cloudflare.com/generate_204"),
-            fallback_test_url=cfg.get("backup_test_url", "https://www.gstatic.com/generate_204"),
-        )
+    # =========================================================================
+    # MENU 2: PROXY COLLECTOR & SOURCES HUB
+    # =========================================================================
 
-        progress = self.views.create_progress_bar()
-        start_time = time.time()
-        alive_nodes: List[ProxyNode] = []
-        dead_nodes: List[ProxyNode] = []
-
-        with progress:
-            task_id = progress.add_task("Checking Proxies...", total=len(raw_nodes))
-
-            def on_prog(completed: int, total: int, last_node: ProxyNode):
-                progress.update(task_id, completed=completed)
-
-            alive_nodes, dead_nodes = asyncio.run(checker.check_nodes(raw_nodes, on_progress=on_prog))
-
-        duration = time.time() - start_time
-        alive_nodes.sort(key=lambda x: x.latency if x.latency > 0 else 999999)
-
-        self._save_active_proxies(alive_nodes)
-        self.views.render_summary(
-            total=len(raw_nodes),
-            alive=len(alive_nodes),
-            dead=len(dead_nodes),
-            duration_sec=duration,
-        )
-        return alive_nodes
-
-    def handle_view_proxies(self) -> None:
-        """Displays paginated table of active proxies with details & sorting options."""
-        active_nodes = self._load_active_proxies()
-        if not active_nodes:
+    def handle_collector_hub(self) -> None:
+        """Unified hub for collecting proxies (upstream, URL, file, paste) and managing upstream sources."""
+        while True:
             self.views.render_banner()
-            self.views.render_status_panel("INFO", "Belum ada proxy aktif tersimpan. Lakukan Scrape/Check dahulu.", style="yellow")
+            sources = self._load_sources()
+            raw_nodes = self._load_raw_proxies()
+
+            self.console.print(
+                f"[dim]Status Collector: {len(sources)} Sumber Upstream Terdaftar | {len(raw_nodes)} Raw Proxies di Cache[/dim]\n"
+            )
+
+            choice = questionary.select(
+                "Pilih aksi Pengumpulan & Sumber Proxy:",
+                choices=[
+                    "[1] Scrape Semua Sumber Upstream (Merge ke Raw Cache)",
+                    "[2] Tambah & Simpan Sumber URL Baru (Bisa Langsung Fetch & Uji)",
+                    "[3] Import dari File Lokal (.txt, .json, .yaml)",
+                    "[4] Direct Paste Link Proxy via Terminal",
+                    "[5] Kelola / Hapus Sumber Upstream yang Terdaftar",
+                    "[6] Jalankan Health Check pada Seluruh Raw Cache Saat Ini",
+                    "[0] Kembali ke Menu Utama",
+                ],
+                style=questionary.Style([("highlighted", "fg:cyan bold")]),
+            ).ask()
+
+            if choice is None or choice.startswith("[0]"):
+                break
+
+            if choice.startswith("[1]"):
+                self._action_scrape_upstream()
+            elif choice.startswith("[2]"):
+                self._action_add_and_fetch_source()
+            elif choice.startswith("[3]"):
+                self._action_import_file()
+            elif choice.startswith("[4]"):
+                self._action_paste_links()
+            elif choice.startswith("[5]"):
+                self._action_manage_sources_list()
+            elif choice.startswith("[6]"):
+                self._action_check_raw_cache()
+
+            questionary.text("Tekan Enter untuk melanjutkan...").ask()
+
+    def _action_scrape_upstream(self) -> None:
+        """Fetch from all upstream sources and merge into raw cache."""
+        sources = self._load_sources()
+        self.console.print(f"[bold cyan]Mengambil proxy dari {len(sources)} sumber upstream...[/bold cyan]")
+        new_nodes = asyncio.run(self.collector.fetch_all_sources(sources))
+        self._save_raw_proxies(new_nodes, merge_with_existing=True)
+        total_raw = len(self._load_raw_proxies())
+        self.views.render_status_panel(
+            "SUKSES",
+            f"Berhasil mengambil {len(new_nodes)} node dari upstream.\nTotal raw proxy dalam database: {total_raw} node.",
+            style="green",
+        )
+
+    def _action_add_and_fetch_source(self) -> None:
+        """Add a new source URL, save it permanently, and optionally fetch/test immediately."""
+        name = questionary.text("Masukkan Nama / Label Sumber (Contoh: My-VIP-Subscription):").ask()
+        if not name:
             return
 
+        url = questionary.text("Masukkan URL Subscription / Upstream Source:").ask()
+        if not url or not url.startswith("http"):
+            self.views.render_status_panel("ERROR", "URL tidak valid. Harus diawali http:// atau https://", style="red")
+            return
+
+        stype = questionary.select(
+            "Pilih Format / Tipe Sumber:",
+            choices=[
+                "base64 (Standard Base64 Subscription string)",
+                "raw_lines (Plain text URI link per baris)",
+                "raw_extract (Markdown / HTML text extractor)",
+            ],
+        ).ask()
+        if not stype:
+            return
+
+        clean_type = stype.split()[0]
+        new_source = {"name": name.strip(), "url": url.strip(), "type": clean_type}
+
+        # Save to sources.json
+        sources = self._load_sources()
+        sources.append(new_source)
+        self._save_sources(sources)
+        self.views.render_status_panel("SUKSES", f"Sumber '{name}' berhasil disimpan ke data/sources.json!", style="green")
+
+        # Ask to fetch & check immediately
+        fetch_now = questionary.confirm("Apakah Anda ingin langsung mengambil & menguji node dari URL ini sekarang?").ask()
+        if fetch_now:
+            self.console.print("[bold cyan]Mengambil node dari sumber baru...[/bold cyan]")
+            fetched = asyncio.run(self.collector.fetch_from_source(new_source))
+            if not fetched:
+                self.views.render_status_panel("PERINGATAN", "Tidak ada node proxy yang berhasil diambil dari URL ini.", style="yellow")
+                return
+
+            self.console.print(f"[green]Berhasil mengambil {len(fetched)} node. Menyimpan ke cache...[/green]")
+            self._save_raw_proxies(fetched, merge_with_existing=True)
+
+            check_now = questionary.confirm(f"Jalankan health check untuk {len(fetched)} node yang baru diambil ini?").ask()
+            if check_now:
+                self._run_health_check_pipeline(fetched, is_interactive=True, save_to_active=True)
+
+    def _action_import_file(self) -> None:
+        """Import raw proxy nodes from local file."""
+        file_path = questionary.text("Masukkan path file lokal (Contoh: /root/proxies.txt atau config.yaml):").ask()
+        if not file_path or not os.path.isfile(file_path):
+            self.views.render_status_panel("ERROR", f"File tidak ditemukan: {file_path}", style="red")
+            return
+
+        imported = self.collector.import_from_file(file_path)
+        if imported:
+            self._save_raw_proxies(imported, merge_with_existing=True)
+            self.views.render_status_panel(
+                "SUKSES",
+                f"Berhasil mengimpor {len(imported)} node dari {file_path} ke raw cache.",
+                style="green",
+            )
+            if questionary.confirm("Langsung jalankan health check untuk node yang baru diimpor?").ask():
+                self._run_health_check_pipeline(imported, is_interactive=True, save_to_active=True)
+        else:
+            self.views.render_status_panel("PERINGATAN", "Tidak ada link proxy yang valid ditemukan di dalam file tersebut.", style="yellow")
+
+    def _action_paste_links(self) -> None:
+        """Direct terminal paste of proxy links."""
+        self.console.print("[bold cyan]Paste link proxy Anda di bawah ini (bisa multi-line). Masukkan baris kosong 'END' saat selesai:[/bold cyan]")
+        lines = []
+        while True:
+            try:
+                line = input()
+                if line.strip().upper() == "END":
+                    break
+                lines.append(line)
+            except EOFError:
+                break
+
+        text = "\n".join(lines)
+        nodes = self.collector.import_from_text(text)
+        if nodes:
+            self._save_raw_proxies(nodes, merge_with_existing=True)
+            self.views.render_status_panel("SUKSES", f"Berhasil mengimpor {len(nodes)} node dari teks input.", style="green")
+            if questionary.confirm("Langsung jalankan health check untuk node ini?").ask():
+                self._run_health_check_pipeline(nodes, is_interactive=True, save_to_active=True)
+        else:
+            self.views.render_status_panel("PERINGATAN", "Tidak ada URI proxy valid yang terdeteksi.", style="yellow")
+
+    def _action_manage_sources_list(self) -> None:
+        """Manage / delete existing upstream sources."""
+        sources = self._load_sources()
+        if not sources:
+            self.views.render_status_panel("INFO", "Belum ada sumber upstream yang tersimpan.", style="yellow")
+            return
+
+        choices = [f"[{i+1}] {s.get('name', 'Unknown')} ({s.get('type', 'raw')}) - {s.get('url', '')[:50]}" for i, s in enumerate(sources)]
+        choices.append("[0] Batal")
+
+        selected = questionary.select("Pilih sumber untuk dikelola / dihapus:", choices=choices).ask()
+        if not selected or selected.startswith("[0]"):
+            return
+
+        idx = int(selected.split("]")[0][1:]) - 1
+        src = sources[idx]
+
+        action = questionary.select(
+            f"Aksi untuk '{src.get('name')}':",
+            choices=["[1] Uji & Ambil Node dari Sumber Ini Saja", "[2] Hapus Sumber Ini", "[0] Batal"],
+        ).ask()
+
+        if action and action.startswith("[1]"):
+            self.console.print(f"[bold cyan]Mengambil node dari '{src.get('name')}'...[/bold cyan]")
+            nodes = asyncio.run(self.collector.fetch_from_source(src))
+            if nodes:
+                self.views.render_status_panel("SUKSES", f"Berhasil mengambil {len(nodes)} node dari sumber ini.", style="green")
+                self._save_raw_proxies(nodes, merge_with_existing=True)
+                if questionary.confirm("Jalankan health check untuk node ini?").ask():
+                    self._run_health_check_pipeline(nodes, is_interactive=True, save_to_active=True)
+            else:
+                self.views.render_status_panel("PERINGATAN", "Gagal mengambil node dari URL ini atau URL kosong.", style="yellow")
+
+        elif action and action.startswith("[2]"):
+            sources.pop(idx)
+            self._save_sources(sources)
+            self.views.render_status_panel("SUKSES", f"Sumber '{src.get('name')}' berhasil dihapus.", style="green")
+
+    def _action_check_raw_cache(self) -> None:
+        """Run health check on current raw cache."""
+        raw_nodes = self._load_raw_proxies()
+        if not raw_nodes:
+            self.views.render_status_panel("PERINGATAN", "Database raw proxy masih kosong. Silakan kumpulkan proxy terlebih dahulu.", style="yellow")
+            return
+        self.console.print(f"[bold cyan]Menjalankan Health Check pada {len(raw_nodes)} raw nodes...[/bold cyan]")
+        self._run_health_check_pipeline(raw_nodes, is_interactive=True, save_to_active=True)
+
+    # =========================================================================
+    # MENU 3: PROXY EXPLORER & LIVE FILTER (UNIFIED VIEW + FILTER + RUN)
+    # =========================================================================
+
+    def handle_proxy_explorer(self) -> None:
+        """Interactive table explorer with real-time filtering, sorting, pagination, and direct runner binding."""
         page = 1
-        page_size = 20
-        sort_by = "latency"
+        page_size = 15
+        active_filter: Dict[str, Any] = {"country": None, "protocol": None, "max_latency": None}
+        current_sort = "latency"
 
         while True:
             self.views.render_banner()
+            all_active = self._load_active_proxies()
 
-            nodes_to_show = list(active_nodes)
-            if sort_by == "latency":
-                nodes_to_show.sort(key=lambda x: x.latency if x.latency > 0 else 999999)
-            elif sort_by == "country":
-                nodes_to_show.sort(key=lambda x: x.country_code or "ZZ")
-            elif sort_by == "protocol":
-                nodes_to_show.sort(key=lambda x: x.protocol or "")
-            elif sort_by == "server":
-                nodes_to_show.sort(key=lambda x: x.server or "")
+            if not all_active:
+                self.views.render_status_panel(
+                    "DATABASE KOSONG",
+                    "Belum ada proxy aktif yang terverifikasi.\nSilakan jalankan [1] Quick Update atau [2] Kumpulkan Proxy & Health Check.",
+                    style="yellow",
+                )
+                questionary.text("Tekan Enter untuk kembali ke Menu Utama...").ask()
+                break
 
-            total_pages = max(1, (len(nodes_to_show) + page_size - 1) // page_size)
+            # Apply active filters
+            displayed_nodes = self.exporter.filter_nodes(
+                all_active,
+                country=active_filter["country"],
+                protocol=active_filter["protocol"],
+                max_latency=active_filter["max_latency"],
+            )
+
+            # Apply sorting
+            if current_sort == "latency":
+                displayed_nodes.sort(key=lambda x: x.latency if x.latency > 0 else 999999)
+            elif current_sort == "country":
+                displayed_nodes.sort(key=lambda x: x.country_code or "ZZ")
+            elif current_sort == "protocol":
+                displayed_nodes.sort(key=lambda x: x.protocol or "")
+            elif current_sort == "server":
+                displayed_nodes.sort(key=lambda x: x.server or "")
+
+            total_pages = max(1, (len(displayed_nodes) + page_size - 1) // page_size)
             page = max(1, min(page, total_pages))
 
+            filter_desc = []
+            if active_filter["country"]:
+                filter_desc.append(f"Negara: {active_filter['country']}")
+            if active_filter["protocol"]:
+                filter_desc.append(f"Protokol: {active_filter['protocol']}")
+            if active_filter["max_latency"]:
+                filter_desc.append(f"Max Latency: <{active_filter['max_latency']}ms")
+
+            filter_str = f" [Filter: {', '.join(filter_desc)}]" if filter_desc else ""
+            title_table = f"DAFTAR PROXY AKTIF{filter_str} (Urut: {current_sort.upper()})"
+
             self.views.render_proxy_table(
-                nodes=nodes_to_show,
-                title=f"DAFTAR PROXY AKTIF (Sorted by {sort_by.upper()})",
+                displayed_nodes,
+                title=title_table,
                 page=page,
                 page_size=page_size,
             )
 
-            actions = []
-            if page < total_pages:
-                actions.append("[n] Next Page")
-            if page > 1:
-                actions.append("[p] Previous Page")
-            actions.extend([
-                "[s] Sort Options (Latency / Country / Protocol / Server)",
-                "[d] Detail Proxy Node",
+            choices = [
+                f"[1] Navigasi Halaman ({page}/{total_pages})",
+                "[2] Filter Berdasarkan Negara / Protokol / Latensi",
+                "[3] Reset Filter (Tampilkan Semua)",
+                "[4] Urutkan Daftar (Sort by Latency, Country, Protocol, Server)",
+                "[5] Lihat Detail Node Lengkap & Jalankan di Local Proxy",
+                "[6] Ekspor Hasil Tampilan Ini ke File",
                 "[0] Kembali ke Menu Utama",
-            ])
+            ]
 
-            choice = questionary.select("Pilih aksi navigasi:", choices=actions).ask()
-
-            if choice is None or choice.startswith("[0]"):
+            act = questionary.select("Pilih Aksi Explorer:", choices=choices).ask()
+            if not act or act.startswith("[0]"):
                 break
-            elif choice.startswith("[n]"):
-                page += 1
-            elif choice.startswith("[p]"):
-                page -= 1
-            elif choice.startswith("[s]"):
+
+            if act.startswith("[1]"):
+                pg_input = questionary.text(f"Pindah ke halaman (1-{total_pages}):", default=str(page)).ask()
+                if pg_input and pg_input.isdigit():
+                    page = int(pg_input)
+
+            elif act.startswith("[2]"):
+                c_in = questionary.text("Filter Kode Negara (Kosongkan jika tidak ada, misal: ID, SG, US):").ask()
+                p_in = questionary.text("Filter Protokol (Kosongkan jika tidak ada, misal: VLESS, TROJAN, HYSTERIA2):").ask()
+                l_in = questionary.text("Filter Latensi Maksimal ms (Kosongkan jika tidak ada, misal: 150):").ask()
+
+                active_filter["country"] = c_in.strip().upper() if c_in and c_in.strip() else None
+                active_filter["protocol"] = p_in.strip().lower() if p_in and p_in.strip() else None
+                active_filter["max_latency"] = int(l_in.strip()) if l_in and l_in.strip().isdigit() else None
+                page = 1
+
+            elif act.startswith("[3]"):
+                active_filter = {"country": None, "protocol": None, "max_latency": None}
+                page = 1
+                self.views.render_status_panel("INFO", "Filter berhasil di-reset.", style="cyan")
+                time.sleep(0.5)
+
+            elif act.startswith("[4]"):
                 sort_choice = questionary.select(
-                    "Urutkan Berdasarkan:",
+                    "Pilih Kriteria Pengurutan:",
                     choices=[
-                        "Latency (Tercepat)",
-                        "Country (Kode Negara)",
-                        "Protocol (Jenis Protokol)",
-                        "Server (Host / IP)",
+                        "latency (Tercepat -> Terlambat)",
+                        "country (Abjad Kode Negara)",
+                        "protocol (Abjad Nama Protokol)",
+                        "server (Abjad Server Host)",
                     ],
                 ).ask()
                 if sort_choice:
-                    if "Latency" in sort_choice:
-                        sort_by = "latency"
-                    elif "Country" in sort_choice:
-                        sort_by = "country"
-                    elif "Protocol" in sort_choice:
-                        sort_by = "protocol"
-                    elif "Server" in sort_choice:
-                        sort_by = "server"
-            elif choice.startswith("[d]"):
-                idx_str = questionary.text(f"Masukkan nomor proxy (1 - {len(nodes_to_show)}):").ask()
-                if idx_str and idx_str.isdigit():
-                    idx = int(idx_str) - 1
-                    if 0 <= idx < len(nodes_to_show):
-                        node = nodes_to_show[idx]
-                        self._render_node_detail(node)
-                        questionary.text("Tekan Enter untuk kembali...").ask()
+                    current_sort = sort_choice.split()[0]
 
-    def _render_node_detail(self, node: ProxyNode) -> None:
-        """Render detailed breakdown panel for a specific ProxyNode."""
-        content = Text()
-        content.append("Node ID       : ", style="bold cyan")
-        content.append(f"{node.id}\n", style="white")
-        content.append("Name          : ", style="bold cyan")
-        content.append(f"{node.name}\n", style="bold yellow")
-        content.append("Protocol      : ", style="bold cyan")
-        content.append(f"{node.protocol.upper()}\n", style="bold green")
-        content.append("Server        : ", style="bold cyan")
-        content.append(f"{node.server}\n", style="white")
-        content.append("Port          : ", style="bold cyan")
-        content.append(f"{node.port}\n", style="white")
-        content.append("Country       : ", style="bold cyan")
-        content.append(f"[{node.country_code}] {node.country_name}\n", style="bold yellow")
-        content.append("Latency       : ", style="bold cyan")
-        content.append(f"{node.latency} ms\n", style="bold green" if node.latency < 300 else "bold red")
-        content.append("Last Checked  : ", style="bold cyan")
-        content.append(f"{node.last_checked}\n\n", style="dim white")
-        content.append("Raw URI:\n", style="bold cyan")
-        content.append(f"{node.raw_uri}\n\n", style="dim white")
-        content.append("Sing-box Outbound Config:\n", style="bold cyan")
-        content.append(f"{json.dumps(node.config, indent=2)}", style="green")
+            elif act.startswith("[5]"):
+                self._action_view_node_detail_and_bind(displayed_nodes, page, page_size)
 
-        panel = Panel(
-            content,
-            title="[bold cyan]DETAIL PROXY NODE[/bold cyan]",
-            border_style="cyan",
-            box=box.ASCII,
-        )
+            elif act.startswith("[6]"):
+                self._action_export_subset(displayed_nodes)
+
+    def _action_view_node_detail_and_bind(self, nodes: List[ProxyNode], page: int, page_size: int) -> None:
+        """View detailed configuration of a node and provide quick run binding."""
+        start_idx = (page - 1) * page_size
+        page_nodes = nodes[start_idx : start_idx + page_size]
+        if not page_nodes:
+            return
+
+        choices = [f"[{i+1}] {n.name} ({n.protocol.upper()}) - {n.server}:{n.port}" for i, n in enumerate(page_nodes)]
+        choices.append("[0] Batal")
+
+        sel = questionary.select("Pilih node untuk melihat detail:", choices=choices).ask()
+        if not sel or sel.startswith("[0]"):
+            return
+
+        node_idx = int(sel.split("]")[0][1:]) - 1
+        node = page_nodes[node_idx]
+
+        detail_text = Text()
+        detail_text.append(f"Nama Node  : {node.name}\n", style="bold cyan")
+        detail_text.append(f"Protokol   : {node.protocol.upper()}\n", style="bold yellow")
+        detail_text.append(f"Server Host: {node.server}\n", style="white")
+        detail_text.append(f"Port       : {node.port}\n", style="white")
+        detail_text.append(f"Negara     : [{node.country_code}] {node.country_name}\n", style="green")
+        detail_text.append(f"Latensi    : {node.latency} ms\n", style="bold green" if node.latency < 100 else "yellow")
+        detail_text.append(f"ID Hash    : {node.id}\n\n", style="dim white")
+        detail_text.append("Sing-box Outbound Config:\n", style="bold cyan")
+        detail_text.append(json.dumps(node.config, indent=2), style="dim green")
+        detail_text.append("\n\nRaw URI Link:\n", style="bold cyan")
+        detail_text.append(node.raw_uri or "-", style="dim yellow")
+
+        panel = Panel(detail_text, title=f"[bold cyan]DETAIL NODE - {node.name}[/bold cyan]", box=box.ASCII)
         self.console.print(panel)
 
-    def handle_export(self) -> None:
-        """Lets user choose export format and apply optional filters."""
-        self.views.render_banner()
-        active_nodes = self._load_active_proxies()
-        if not active_nodes:
-            self.views.render_status_panel("WARNING", "Belum ada proxy aktif untuk diekspor. Scrape/Check dahulu.", style="yellow")
-            return
-
-        choice = questionary.select(
-            "Pilih Format Ekspor Proxy:",
+        act = questionary.select(
+            "Aksi untuk Node Ini:",
             choices=[
-                "[1] Raw Proxy Links (.txt)",
-                "[2] Base64 Subscription (.txt)",
-                "[3] Clash / Mihomo Configuration (.yaml)",
-                "[4] Sing-box Configuration (.json)",
+                "[1] Jalankan Node Ini Sebagai Local SOCKS5 / HTTP Proxy",
+                "[2] Salin / Tampilkan Raw URI",
                 "[0] Kembali",
             ],
         ).ask()
 
-        if choice is None or choice.startswith("[0]"):
+        if act and act.startswith("[1]"):
+            self._start_runner_with_node(node)
+        elif act and act.startswith("[2]"):
+            self.console.print(Panel(Text(node.raw_uri, style="bold yellow"), title="RAW URI LINK", box=box.ASCII))
+            questionary.text("Tekan Enter untuk melanjutkan...").ask()
+
+    def _start_runner_with_node(self, node: ProxyNode) -> None:
+        """Start local proxy runner using selected node."""
+        cfg = self._load_config()
+        socks_port = int(cfg.get("local_socks_port", 1080))
+        http_port = int(cfg.get("local_http_port", 1081))
+
+        self.console.print(f"[bold cyan]Menjalankan local proxy server untuk node '{node.name}'...[/bold cyan]")
+        try:
+            bm = BinaryManager()
+            bin_path = bm.ensure_singbox()
+            self.runner.bin_path = bin_path
+        except Exception as e:
+            self.views.render_status_panel("ERROR", f"Gagal memverifikasi sing-box: {e}", style="red")
             return
-
-        country = questionary.text("Filter Negara (misal: SG, US, ID atau tekan Enter untuk Semua):").ask()
-        protocol = questionary.text("Filter Protokol (misal: trojan, vless, vmess, ss, hy2 atau Enter):").ask()
-        max_lat_str = questionary.text("Max Latency ms (misal: 300, 500 atau Enter untuk Tanpa Batas):").ask()
-
-        country_filter = country.strip() if country and country.strip() else None
-        protocol_filter = protocol.strip() if protocol and protocol.strip() else None
-        max_latency_filter = int(max_lat_str.strip()) if max_lat_str and max_lat_str.strip().isdigit() else None
-
-        filtered_nodes = self.exporter.filter_nodes(
-            active_nodes,
-            country=country_filter,
-            protocol=protocol_filter,
-            max_latency=max_latency_filter,
-        )
-
-        if not filtered_nodes:
-            self.views.render_status_panel("WARNING", "Tidak ada proxy yang memenuhi kriteria filter.", style="yellow")
-            return
-
-        default_filenames = {
-            "[1]": "data/exports/proxies_raw.txt",
-            "[2]": "data/exports/proxies_base64.txt",
-            "[3]": "data/exports/clash.yaml",
-            "[4]": "data/exports/singbox.json",
-        }
-
-        key = choice[:3]
-        default_file = default_filenames.get(key, "data/exports/output.txt")
-        out_path = questionary.text(f"Masukkan path file output (Default: {default_file}):").ask()
-        output_file = out_path.strip() if out_path and out_path.strip() else default_file
-
-        if choice.startswith("[1]"):
-            saved_path = self.exporter.export_raw(filtered_nodes, output_file)
-        elif choice.startswith("[2]"):
-            saved_path = self.exporter.export_base64(filtered_nodes, output_file)
-        elif choice.startswith("[3]"):
-            saved_path = self.exporter.export_clash(filtered_nodes, output_file)
-        elif choice.startswith("[4]"):
-            saved_path = self.exporter.export_singbox(filtered_nodes, output_file)
-        else:
-            return
-
-        self.views.render_status_panel(
-            "EKSPOR SUCCESS",
-            f"Berhasil mengekspor {len(filtered_nodes)} node proxy ke:\n{saved_path}",
-            style="green",
-        )
-
-    def handle_local_runner(self) -> None:
-        """Start / Stop local proxy runner daemon forwarding traffic through selected node."""
-        self.views.render_banner()
-        runner_status = self.runner.get_status()
-        self.views.render_runner_status(runner_status)
 
         if self.runner.is_running():
-            choice = questionary.select(
-                "Pilih Aksi Local Proxy Server:",
-                choices=[
-                    "[1] Hentikan Local Proxy Server (Stop Daemon)",
-                    "[2] Ganti Active Proxy Node",
-                    "[0] Kembali",
-                ],
-            ).ask()
+            self.runner.stop()
 
-            if choice and choice.startswith("[1]"):
-                self.runner.stop()
-                self.views.render_status_panel("RUNNER", "Local proxy daemon dihentikan.", style="yellow")
-                return
-            elif choice and choice.startswith("[2]"):
-                self.runner.stop()
-            else:
-                return
-
-        active_nodes = self._load_active_proxies()
-        if not active_nodes:
-            self.views.render_status_panel("WARNING", "Belum ada proxy aktif. Lakukan Health Check terlebih dahulu.", style="yellow")
-            return
-
-        active_nodes.sort(key=lambda x: x.latency if x.latency > 0 else 999999)
-
-        node_choices = [
-            f"[{idx+1}] {n.name} ({n.latency}ms)" for idx, n in enumerate(active_nodes[:20])
-        ]
-        node_choices.append("[0] Batal")
-
-        sel_node = questionary.select("Pilih proxy node untuk local daemon:", choices=node_choices).ask()
-        if not sel_node or sel_node.startswith("[0]"):
-            return
-
-        idx = int(sel_node.split("]")[0].replace("[", "")) - 1
-        target_node = active_nodes[idx]
-
-        cfg = self._load_config()
-        socks_p = questionary.text(f"Masukkan Port SOCKS5 Local (Default: {cfg.get('local_socks_port', 1080)}):").ask()
-        http_p = questionary.text(f"Masukkan Port HTTP Local (Default: {cfg.get('local_http_port', 1081)}):").ask()
-
-        socks_port = int(socks_p.strip()) if socks_p and socks_p.strip().isdigit() else cfg.get("local_socks_port", 1080)
-        http_port = int(http_p.strip()) if http_p and http_p.strip().isdigit() else cfg.get("local_http_port", 1081)
-
-        self.console.print("[bold cyan]Menjalankan local proxy server sing-box...[/bold cyan]")
-        success = self.runner.start(target_node, socks_port=socks_port, http_port=http_port)
-
+        success = self.runner.start(node, socks_port=socks_port, http_port=http_port)
         if success:
-            self.views.render_runner_status(self.runner.get_status())
+            self.views.render_status_panel(
+                "LOCAL PROXY BERHASIL AKTIF",
+                f"Node        : {node.name}\n"
+                f"SOCKS5 Proxy: 127.0.0.1:{socks_port}\n"
+                f"HTTP Proxy  : 127.0.0.1:{http_port}\n"
+                f"Status      : [RUNNING] di latar belakang.",
+                style="green",
+            )
         else:
             self.views.render_status_panel("ERROR", "Gagal menjalankan local proxy daemon sing-box.", style="red")
+        questionary.text("Tekan Enter untuk melanjutkan...").ask()
 
-    def handle_scheduler(self) -> None:
-        """Start / Stop auto-scheduler periodic background job."""
+    # =========================================================================
+    # MENU 4: EXPORT CENTER
+    # =========================================================================
+
+    def handle_export(self) -> None:
+        """Dedicated export center supporting all format generators and filters."""
         self.views.render_banner()
-        sched_status = self.scheduler.get_status()
-        self.views.render_scheduler_status(sched_status)
+        all_active = self._load_active_proxies()
 
-        if self.scheduler.is_running():
-            choice = questionary.select(
-                "Pilih Aksi Auto-Scheduler:",
-                choices=[
-                    "[1] Hentikan Auto-Scheduler",
-                    "[2] Ubah Interval Pengecekan",
-                    "[0] Kembali",
-                ],
-            ).ask()
+        if not all_active:
+            self.views.render_status_panel("PERINGATAN", "Tidak ada proxy aktif dalam database untuk diekspor.", style="yellow")
+            questionary.text("Tekan Enter untuk kembali...").ask()
+            return
 
-            if choice and choice.startswith("[1]"):
-                self.scheduler.stop()
-                self.views.render_status_panel("SCHEDULER", "Auto-scheduler background job dihentikan.", style="yellow")
-                return
-            elif choice and choice.startswith("[2]"):
-                self.scheduler.stop()
-            else:
-                return
-
-        choice = questionary.select(
-            "Pilih Aksi Auto-Scheduler:",
+        scope = questionary.select(
+            "Pilih Cakupan Node yang Akan Diekspor:",
             choices=[
-                "[1] Jalankan Auto-Scheduler Background Job",
-                "[0] Kembali",
+                f"[1] Ekspor Semua Proxy Aktif ({len(all_active)} node)",
+                "[2] Ekspor dengan Filter Kustom (Negara, Protokol, Latensi)",
+                "[0] Batal",
             ],
         ).ask()
 
-        if not choice or choice.startswith("[0]"):
+        if not scope or scope.startswith("[0]"):
             return
 
-        cfg = self._load_config()
-        default_interval = cfg.get("auto_update_interval_minutes", 60)
-        inv_str = questionary.text(f"Masukkan interval pengecekan otomatis dalam menit (Default: {default_interval}):").ask()
-        interval = float(inv_str.strip()) if inv_str and inv_str.strip().replace(".", "", 1).isdigit() else float(default_interval)
+        target_nodes = all_active
+        if scope.startswith("[2]"):
+            c_in = questionary.text("Filter Kode Negara (Kosongkan jika tidak ada, misal: ID, SG):").ask()
+            p_in = questionary.text("Filter Protokol (Kosongkan jika tidak ada, misal: VLESS, HYSTERIA2):").ask()
+            l_in = questionary.text("Filter Max Latency ms (Kosongkan jika tidak ada, misal: 150):").ask()
 
-        self.console.print(f"[bold cyan]Memulai Auto-Scheduler (Interval: {interval} menit)...[/bold cyan]")
-        self.scheduler.start(
-            interval_minutes=interval,
-            task_callback=self.handle_scrape_and_check_all,
-            on_log=lambda msg: self.console.print(f"[dim cyan]{msg}[/dim cyan]"),
+            c_val = c_in.strip().upper() if c_in and c_in.strip() else None
+            p_val = p_in.strip().lower() if p_in and p_in.strip() else None
+            l_val = int(l_in.strip()) if l_in and l_in.strip().isdigit() else None
+
+            target_nodes = self.exporter.filter_nodes(all_active, country=c_val, protocol=p_val, max_latency=l_val)
+            if not target_nodes:
+                self.views.render_status_panel("INFO", "Tidak ada node yang cocok dengan kriteria filter tersebut.", style="yellow")
+                questionary.text("Tekan Enter untuk kembali...").ask()
+                return
+
+        self._action_export_subset(target_nodes)
+
+    def _action_export_subset(self, nodes: List[ProxyNode]) -> None:
+        """Export a subset of nodes to chosen format."""
+        fmt = questionary.select(
+            f"Pilih Format Ekspor untuk {len(nodes)} node:",
+            choices=[
+                "[1] Raw Links .txt (Daftar URI link per baris)",
+                "[2] Base64 Subscription (String Sub standar v2rayN/NekoBox)",
+                "[3] Clash Meta / Mihomo YAML (Proxy Groups & Rules)",
+                "[4] Sing-box JSON (Outbounds 1.9+ & URLTest Group)",
+                "[5] Ekspor ke SEMUA Format Sekaligus",
+                "[0] Batal",
+            ],
+        ).ask()
+
+        if not fmt or fmt.startswith("[0]"):
+            return
+
+        os.makedirs(EXPORTS_DIR, exist_ok=True)
+        exported_files = []
+
+        if fmt.startswith("[1]") or fmt.startswith("[5]"):
+            p = f"{EXPORTS_DIR}/proxies_raw.txt"
+            self.exporter.export_raw(nodes, p)
+            exported_files.append(p)
+
+        if fmt.startswith("[2]") or fmt.startswith("[5]"):
+            p = f"{EXPORTS_DIR}/subscription_base64.txt"
+            self.exporter.export_base64(nodes, p)
+            exported_files.append(p)
+
+        if fmt.startswith("[3]") or fmt.startswith("[5]"):
+            p = f"{EXPORTS_DIR}/clash_meta.yaml"
+            self.exporter.export_clash(nodes, p)
+            exported_files.append(p)
+
+        if fmt.startswith("[4]") or fmt.startswith("[5]"):
+            p = f"{EXPORTS_DIR}/singbox_config.json"
+            self.exporter.export_singbox(nodes, p)
+            exported_files.append(p)
+
+        file_list = "\n".join([f"- {f}" for f in exported_files])
+        self.views.render_status_panel(
+            "EKSPOR BERHASIL",
+            f"Berhasil mengekspor {len(nodes)} proxy ke:\n{file_list}",
+            style="green",
         )
-        self.views.render_scheduler_status(self.scheduler.get_status())
+        questionary.text("Tekan Enter untuk melanjutkan...").ask()
 
-    def handle_settings(self) -> None:
-        """Edit concurrency, timeout, test URL, and manage upstream sources."""
+    # =========================================================================
+    # MENU 5: LOCAL PROXY RUNNER (SOCKS5 / HTTP DAEMON)
+    # =========================================================================
+
+    def handle_local_runner(self) -> None:
+        """Local SOCKS5 / HTTP Proxy runner manager."""
+        while True:
+            self.views.render_banner()
+            status = self.runner.get_status()
+            self.views.render_runner_status(status)
+
+            choices = []
+            if status.get("status") == "RUNNING" or status.get("running"):
+                choices.append("[1] Hentikan Local Proxy Server (Stop)")
+                choices.append("[2] Ganti Node Proxy Aktif")
+            else:
+                choices.append("[1] Jalankan Local Proxy Server (Pilih Node)")
+
+            choices.append("[0] Kembali ke Menu Utama")
+
+            act = questionary.select("Pilih Aksi Local Proxy:", choices=choices).ask()
+            if not act or act.startswith("[0]"):
+                break
+
+            if "Hentikan" in act:
+                self.runner.stop()
+                self.views.render_status_panel("SUKSES", "Local Proxy Server berhasil dihentikan.", style="yellow")
+                time.sleep(0.5)
+
+            elif "Jalankan" in act or "Ganti" in act:
+                active_nodes = self._load_active_proxies()
+                if not active_nodes:
+                    self.views.render_status_panel(
+                        "PERINGATAN",
+                        "Belum ada proxy aktif. Silakan lakukan health check terlebih dahulu.",
+                        style="yellow",
+                    )
+                    questionary.text("Tekan Enter...").ask()
+                    continue
+
+                # Node selection with clean prompt
+                node_choices = [
+                    f"[{i+1}] {n.name} ({n.protocol.upper()}) - {n.server}:{n.port}"
+                    for i, n in enumerate(active_nodes[:50])
+                ]
+                node_choices.append("[0] Batal")
+
+                selected_node = questionary.select("Pilih Node untuk dijalankan:", choices=node_choices).ask()
+                if selected_node and not selected_node.startswith("[0]"):
+                    idx = int(selected_node.split("]")[0][1:]) - 1
+                    target_node = active_nodes[idx]
+                    self._start_runner_with_node(target_node)
+
+    # =========================================================================
+    # MENU 6: AUTOMATION & SETTINGS (SCHEDULER & ENGINE CONFIG)
+    # =========================================================================
+
+    def handle_automation_and_settings(self) -> None:
+        """Unified hub for background auto-scheduler and engine configuration."""
         while True:
             self.views.render_banner()
             cfg = self._load_config()
+            sched_status = self.scheduler.get_status()
 
-            choice = questionary.select(
-                "Pengaturan & Kelola Upstream Sources:",
-                choices=[
-                    f"[1] Ubah Concurrency Checker (Current: {cfg.get('concurrency', 30)})",
-                    f"[2] Ubah Timeout Check (ms) (Current: {cfg.get('timeout', 5000)} ms)",
-                    f"[3] Ubah Target Test URL (Current: {cfg.get('test_url', '')})",
-                    "[4] Kelola Upstream Sources (Tambah/Hapus/Lihat Sumber)",
+            self.views.render_scheduler_status(sched_status)
+
+            config_text = Text()
+            config_text.append(f"Concurrency Workers : {cfg.get('concurrency', 30)}\n", style="bold cyan")
+            config_text.append(f"Request Timeout     : {cfg.get('timeout', 5000)} ms\n", style="bold cyan")
+            config_text.append(f"Test URL Endpoint   : {cfg.get('test_url', '')}\n", style="bold cyan")
+            config_text.append(f"Local SOCKS5 Port   : {cfg.get('local_socks_port', 1080)}\n", style="bold cyan")
+            config_text.append(f"Local HTTP Port     : {cfg.get('local_http_port', 1081)}\n", style="bold cyan")
+            config_text.append(f"Auto-Update Interval: {cfg.get('auto_update_interval_minutes', 60)} menit", style="bold cyan")
+
+            panel = Panel(config_text, title="[bold cyan]PENGATURAN ENGINE CHECKER[/bold cyan]", box=box.ASCII)
+            self.console.print(panel)
+
+            choices = []
+            if sched_status.get("status") == "RUNNING" or sched_status.get("active"):
+                choices.append("[1] Matikan Auto-Scheduler Background")
+            else:
+                choices.append("[1] Aktifkan Auto-Scheduler Background")
+
+            choices.extend(
+                [
+                    "[2] Ubah Interval Auto-Update Scheduler",
+                    "[3] Ubah Concurrency Checker Workers",
+                    "[4] Ubah Request Timeout Checker",
+                    "[5] Ubah Test URL Endpoint",
+                    "[6] Ubah Port Inbound Local Proxy (SOCKS5 / HTTP)",
                     "[0] Kembali ke Menu Utama",
-                ],
-            ).ask()
+                ]
+            )
 
-            if choice is None or choice.startswith("[0]"):
+            act = questionary.select("Pilih Pengaturan:", choices=choices).ask()
+            if not act or act.startswith("[0]"):
                 break
-            elif choice.startswith("[1]"):
-                val = questionary.text(f"Masukkan Concurrency baru (1 - 200, Current: {cfg.get('concurrency', 30)}):").ask()
-                if val and val.strip().isdigit():
-                    cfg["concurrency"] = int(val.strip())
+
+            if act.startswith("[1]"):
+                if self.scheduler.is_running():
+                    self.scheduler.stop()
+                    self.views.render_status_panel("SUKSES", "Auto-scheduler background berhasil dinonaktifkan.", style="yellow")
+                else:
+                    interval = float(cfg.get("auto_update_interval_minutes", 60))
+                    self.scheduler.start(interval_minutes=interval, task_callback=self.handle_headless_update)
+                    self.views.render_status_panel(
+                        "SUKSES",
+                        f"Auto-scheduler aktif! Pengecekan otomatis akan berjalan tiap {interval} menit.",
+                        style="green",
+                    )
+                time.sleep(0.5)
+
+            elif act.startswith("[2]"):
+                val = questionary.text("Masukkan interval auto-update baru (dalam menit, misal: 30 atau 60):").ask()
+                if val and val.isdigit() and int(val) > 0:
+                    cfg["auto_update_interval_minutes"] = int(val)
                     self._save_config(cfg)
-                    self.views.render_status_panel("SUCCESS", f"Concurrency diubah menjadi: {cfg['concurrency']}", style="green")
-            elif choice.startswith("[2]"):
-                val = questionary.text(f"Masukkan Timeout baru dalam ms (Current: {cfg.get('timeout', 5000)}):").ask()
-                if val and val.strip().isdigit():
-                    cfg["timeout"] = int(val.strip())
+                    if self.scheduler.is_running():
+                        self.scheduler.start(interval_minutes=int(val), task_callback=self.handle_headless_update)
+                    self.views.render_status_panel("SUKSES", f"Interval berhasil diubah menjadi {val} menit.", style="green")
+                    time.sleep(0.5)
+
+            elif act.startswith("[3]"):
+                val = questionary.text("Masukkan jumlah concurrency workers (10 - 100):", default=str(cfg.get("concurrency", 30))).ask()
+                if val and val.isdigit():
+                    cfg["concurrency"] = max(1, min(200, int(val)))
                     self._save_config(cfg)
-                    self.views.render_status_panel("SUCCESS", f"Timeout diubah menjadi: {cfg['timeout']} ms", style="green")
-            elif choice.startswith("[3]"):
-                val = questionary.text(f"Masukkan Test URL baru (Current: {cfg.get('test_url', '')}):").ask()
-                if val and val.strip():
+                    self.views.render_status_panel("SUKSES", f"Concurrency diubah ke {cfg['concurrency']}.", style="green")
+                    time.sleep(0.5)
+
+            elif act.startswith("[4]"):
+                val = questionary.text("Masukkan timeout koneksi dalam ms (1000 - 15000):", default=str(cfg.get("timeout", 5000))).ask()
+                if val and val.isdigit():
+                    cfg["timeout"] = int(val)
+                    self._save_config(cfg)
+                    self.views.render_status_panel("SUKSES", f"Timeout diubah ke {cfg['timeout']} ms.", style="green")
+                    time.sleep(0.5)
+
+            elif act.startswith("[5]"):
+                val = questionary.text("Masukkan Test URL Connectivity Endpoint:", default=cfg.get("test_url", "")).ask()
+                if val and val.startswith("http"):
                     cfg["test_url"] = val.strip()
                     self._save_config(cfg)
-                    self.views.render_status_panel("SUCCESS", f"Test URL diubah menjadi: {cfg['test_url']}", style="green")
-            elif choice.startswith("[4]"):
-                self._handle_sources_management()
+                    self.views.render_status_panel("SUKSES", "Test URL berhasil diperbarui.", style="green")
+                    time.sleep(0.5)
 
-    def _handle_sources_management(self) -> None:
-        """Submenu to view, add, or delete upstream subscription sources."""
-        while True:
-            self.views.render_banner()
-            sources = self._load_sources()
+            elif act.startswith("[6]"):
+                s_port = questionary.text("Port Lokal SOCKS5:", default=str(cfg.get("local_socks_port", 1080))).ask()
+                h_port = questionary.text("Port Lokal HTTP:", default=str(cfg.get("local_http_port", 1081))).ask()
+                if s_port and s_port.isdigit() and h_port and h_port.isdigit():
+                    cfg["local_socks_port"] = int(s_port)
+                    cfg["local_http_port"] = int(h_port)
+                    self._save_config(cfg)
+                    self.views.render_status_panel("SUKSES", "Port local proxy berhasil diperbarui.", style="green")
+                    time.sleep(0.5)
 
-            self.console.print("[bold cyan]Daftar Upstream Sources Currently Active:[/bold cyan]")
-            for idx, src in enumerate(sources, 1):
-                self.console.print(f" [{idx}] {src.get('name', 'Source')} -> {src.get('url', '')}")
-
-            choice = questionary.select(
-                "Pilih Aksi Upstream Sources:",
-                choices=[
-                    "[1] Tambah Upstream Source Baru",
-                    "[2] Hapus Upstream Source",
-                    "[0] Kembali",
-                ],
-            ).ask()
-
-            if choice is None or choice.startswith("[0]"):
-                break
-            elif choice.startswith("[1]"):
-                name = questionary.text("Masukkan Nama Source:").ask()
-                url = questionary.text("Masukkan URL Source:").ask()
-                stype = questionary.select("Pilih Tipe Source:", choices=["base64", "raw_lines", "raw_extract", "clash_yaml"]).ask()
-                if name and url:
-                    sources.append({"name": name.strip(), "url": url.strip(), "type": stype or "raw_lines"})
-                    self._save_sources(sources)
-                    self.views.render_status_panel("SUCCESS", f"Source '{name}' berhasil ditambahkan.", style="green")
-            elif choice.startswith("[2]"):
-                if not sources:
-                    self.views.render_status_panel("WARNING", "Tidak ada source untuk dihapus.", style="yellow")
-                    continue
-                del_choices = [f"[{idx}] {s.get('name')}" for idx, s in enumerate(sources, 1)]
-                del_choices.append("[0] Batal")
-                sel_del = questionary.select("Pilih Source yang ingin dihapus:", choices=del_choices).ask()
-                if sel_del and not sel_del.startswith("[0]"):
-                    d_idx = int(sel_del.split("]")[0].replace("[", "")) - 1
-                    removed = sources.pop(d_idx)
-                    self._save_sources(sources)
-                    self.views.render_status_panel("SUCCESS", f"Source '{removed.get('name')}' dihapus.", style="green")
+    # =========================================================================
+    # APPLICATION EXIT & MAIN LOOP
+    # =========================================================================
 
     def handle_exit(self) -> None:
-        """Clean shutdown handler: stops daemon process and scheduler."""
+        """Gracefully stop background processes and clean exit."""
         if self.runner.is_running():
             self.runner.stop()
         if self.scheduler.is_running():
             self.scheduler.stop()
-        self.views.render_status_panel("EXIT", "Terima kasih telah menggunakan Proxy Scraper & Checker TUI.", style="cyan")
+        self.views.render_status_panel("INFO", "Aplikasi dihentikan. Sampai jumpa!", style="cyan")
 
     def run(self) -> None:
-        """Main interactive menu loop."""
+        """Main application interactive loop."""
         while True:
             self.views.render_banner()
+            active_count = len(self._load_active_proxies())
+            raw_count = len(self._load_raw_proxies())
+            sources_count = len(self._load_sources())
+
+            summary_text = (
+                f"[dim]Database Status: {active_count} Proxy Aktif | "
+                f"{raw_count} Raw Cache | {sources_count} Upstream Sources[/dim]\n"
+            )
+            self.console.print(summary_text)
+
             choice = questionary.select(
-                "Pilih menu utama:",
+                "Pilih Menu Utama:",
                 choices=[
-                    "[1] Scrape & Auto-Check Semua Sumber (One-Click Update)",
-                    "[2] Kumpulkan Proxy (Scrape Publik / Input Custom URL / File / Paste)",
-                    "[3] Jalankan Health Check & Filter Proxy Aktif",
-                    "[4] Lihat Daftar Proxy Aktif (Tabel Rapi, Detail & Pagination)",
-                    "[5] Ekspor Proxy (Raw Links, Base64 Sub, Clash/Mihomo, Sing-box)",
-                    "[6] Jalankan Local Proxy Server (SOCKS5/HTTP di Localhost)",
-                    "[7] Auto-Scheduler (Pengecekan Berkala di Background)",
-                    "[8] Pengaturan & Kelola Sumber Upstream",
+                    "[1] Quick Update (Scrape Upstream + Health Check All - Safe Merge)",
+                    "[2] Proxy Collector & Sources Hub (Scrape, Add URL, Import, Paste, Kelola Sumber)",
+                    "[3] Proxy Explorer & Live Filter (Lihat Tabel, Filter, Sort, Detail, Run)",
+                    "[4] Ekspor Proxy (Raw Links, Base64 Sub, Clash/Mihomo, Sing-box)",
+                    "[5] Jalankan Local Proxy Server (SOCKS5/HTTP Runner)",
+                    "[6] Otomatisasi & Pengaturan (Scheduler Background & Engine Settings)",
                     "[0] Keluar",
                 ],
+                style=questionary.Style([("highlighted", "fg:cyan bold")]),
             ).ask()
 
             if choice is None or choice.startswith("[0]"):
                 self.handle_exit()
                 break
-            elif choice.startswith("[1]"):
-                self.handle_scrape_and_check_all()
+
+            if choice.startswith("[1]"):
+                self.handle_quick_update()
+                questionary.text("Tekan Enter untuk melanjutkan...").ask()
             elif choice.startswith("[2]"):
-                self.handle_collect_proxies()
+                self.handle_collector_hub()
             elif choice.startswith("[3]"):
-                self.handle_health_check()
+                self.handle_proxy_explorer()
             elif choice.startswith("[4]"):
-                self.handle_view_proxies()
-            elif choice.startswith("[5]"):
                 self.handle_export()
-            elif choice.startswith("[6]"):
+            elif choice.startswith("[5]"):
                 self.handle_local_runner()
-            elif choice.startswith("[7]"):
-                self.handle_scheduler()
-            elif choice.startswith("[8]"):
-                self.handle_settings()
+            elif choice.startswith("[6]"):
+                self.handle_automation_and_settings()

@@ -54,3 +54,39 @@ def test_runner_and_scheduler_integration():
 
     scheduler = AutoScheduler()
     assert not scheduler.is_running()
+
+
+def test_tui_menu_safe_merge_raw(tmp_path, monkeypatch):
+    from tui.menu import TUIMenu
+    monkeypatch.chdir(tmp_path)
+
+    menu = TUIMenu()
+    node1 = ProxyNode(
+        id="node1",
+        protocol="trojan",
+        name="Node 1",
+        server="1.1.1.1",
+        port=443,
+        raw_uri="trojan://pass@1.1.1.1:443#Node1",
+        config={},
+    )
+    node2 = ProxyNode(
+        id="node2",
+        protocol="vless",
+        name="Node 2",
+        server="2.2.2.2",
+        port=443,
+        raw_uri="vless://uuid@2.2.2.2:443#Node2",
+        config={},
+    )
+
+    # Save first batch
+    menu._save_raw_proxies([node1], merge_with_existing=True)
+    assert len(menu._load_raw_proxies()) == 1
+
+    # Save second batch with merge
+    menu._save_raw_proxies([node2], merge_with_existing=True)
+    loaded = menu._load_raw_proxies()
+    assert len(loaded) == 2
+    assert {n.server for n in loaded} == {"1.1.1.1", "2.2.2.2"}
+
