@@ -341,7 +341,9 @@ class TUIMenu:
             return
 
         url = questionary.text("Masukkan URL Subscription / Upstream Source:").ask()
-        if not url or not url.startswith("http"):
+        if not url:
+            return
+        if not url.startswith("http"):
             self.views.render_status_panel("ERROR", "URL tidak valid. Harus diawali http:// atau https://", style="red")
             return
 
@@ -351,9 +353,10 @@ class TUIMenu:
                 "base64 (Standard Base64 Subscription string)",
                 "raw_lines (Plain text URI link per baris)",
                 "raw_extract (Markdown / HTML text extractor)",
+                "[0] Batal",
             ],
         ).ask()
-        if not stype:
+        if not stype or stype.startswith("[0]"):
             return
 
         clean_type = stype.split()[0]
@@ -384,7 +387,9 @@ class TUIMenu:
     def _action_import_file(self) -> None:
         """Import raw proxy nodes from local file."""
         file_path = questionary.text("Masukkan path file lokal (Contoh: /root/proxies.txt atau config.yaml):").ask()
-        if not file_path or not os.path.isfile(file_path):
+        if not file_path:
+            return
+        if not os.path.isfile(file_path):
             self.views.render_status_panel("ERROR", f"File tidak ditemukan: {file_path}", style="red")
             return
 
@@ -411,7 +416,7 @@ class TUIMenu:
                 if line.strip().upper() == "END":
                     break
                 lines.append(line)
-            except EOFError:
+            except (EOFError, KeyboardInterrupt):
                 break
 
         text = "\n".join(lines)
@@ -555,8 +560,14 @@ class TUIMenu:
 
             elif act.startswith("[2]"):
                 c_in = questionary.text("Filter Kode Negara (Kosongkan jika tidak ada, misal: ID, SG, US):").ask()
+                if c_in is None:
+                    continue
                 p_in = questionary.text("Filter Protokol (Kosongkan jika tidak ada, misal: VLESS, TROJAN, HYSTERIA2):").ask()
+                if p_in is None:
+                    continue
                 l_in = questionary.text("Filter Latensi Maksimal ms (Kosongkan jika tidak ada, misal: 150):").ask()
+                if l_in is None:
+                    continue
 
                 active_filter["country"] = c_in.strip().upper() if c_in and c_in.strip() else None
                 active_filter["protocol"] = p_in.strip().lower() if p_in and p_in.strip() else None
@@ -577,9 +588,10 @@ class TUIMenu:
                         "country (Abjad Kode Negara)",
                         "protocol (Abjad Nama Protokol)",
                         "server (Abjad Server Host)",
+                        "[0] Batal (Pertahankan Urutan Saat Ini)",
                     ],
                 ).ask()
-                if sort_choice:
+                if sort_choice and not sort_choice.startswith("[0]"):
                     current_sort = sort_choice.split()[0]
 
             elif act.startswith("[5]"):
@@ -697,8 +709,14 @@ class TUIMenu:
         target_nodes = all_active
         if scope.startswith("[2]"):
             c_in = questionary.text("Filter Kode Negara (Kosongkan jika tidak ada, misal: ID, SG):").ask()
+            if c_in is None:
+                return
             p_in = questionary.text("Filter Protokol (Kosongkan jika tidak ada, misal: VLESS, HYSTERIA2):").ask()
+            if p_in is None:
+                return
             l_in = questionary.text("Filter Max Latency ms (Kosongkan jika tidak ada, misal: 150):").ask()
+            if l_in is None:
+                return
 
             c_val = c_in.strip().upper() if c_in and c_in.strip() else None
             p_val = p_in.strip().lower() if p_in and p_in.strip() else None
@@ -873,7 +891,10 @@ class TUIMenu:
                 time.sleep(0.5)
 
             elif act.startswith("[2]"):
-                val = questionary.text("Masukkan interval auto-update baru (dalam menit, misal: 30 atau 60):").ask()
+                val = questionary.text(
+                    "Masukkan interval auto-update baru (dalam menit, misal: 30 atau 60):",
+                    default=str(cfg.get("auto_update_interval_minutes", 60)),
+                ).ask()
                 if val and val.isdigit() and int(val) > 0:
                     cfg["auto_update_interval_minutes"] = int(val)
                     self._save_config(cfg)
@@ -908,8 +929,12 @@ class TUIMenu:
 
             elif act.startswith("[6]"):
                 s_port = questionary.text("Port Lokal SOCKS5:", default=str(cfg.get("local_socks_port", 1080))).ask()
+                if s_port is None:
+                    continue
                 h_port = questionary.text("Port Lokal HTTP:", default=str(cfg.get("local_http_port", 1081))).ask()
-                if s_port and s_port.isdigit() and h_port and h_port.isdigit():
+                if h_port is None:
+                    continue
+                if s_port.isdigit() and h_port.isdigit():
                     cfg["local_socks_port"] = int(s_port)
                     cfg["local_http_port"] = int(h_port)
                     self._save_config(cfg)
