@@ -7,3 +7,4 @@ data/proxies_active.json
 data/proxies_raw.txt
 data/exports/
 docs/
+config.json
