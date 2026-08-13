@@ -51,10 +51,22 @@ class LocalProxyRunner:
             "outbounds": [outbound],
         }
 
-    def _check_port_open(self, host: str, port: int, timeout: float = 0.5) -> bool:
+    def _check_port_open(
+        self,
+        host_or_port: Any = "127.0.0.1",
+        port: Optional[int] = None,
+        timeout: float = 0.5,
+    ) -> bool:
         """Checks if a TCP port is open and listening."""
+        if isinstance(host_or_port, int):
+            actual_host = "127.0.0.1"
+            actual_port = host_or_port
+        else:
+            actual_host = str(host_or_port)
+            actual_port = port if port is not None else 1080
+
         try:
-            with socket.create_connection((host, port), timeout=timeout):
+            with socket.create_connection((actual_host, actual_port), timeout=timeout):
                 return True
         except (socket.error, OSError):
             return False
@@ -100,6 +112,10 @@ class LocalProxyRunner:
                 os.remove(self.config_path)
                 self.config_path = None
             self.process = None
+            return False
+
+        if not self._check_port_open(socks_port):
+            self.stop()
             return False
 
         self.current_node = node

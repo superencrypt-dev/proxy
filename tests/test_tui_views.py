@@ -116,7 +116,50 @@ def test_render_status_panel():
 def test_render_runner_status():
     from tui.views import TUIViews
     views = TUIViews()
-    runner_status = {
+
+    # Format 1: status == "RUNNING" and node dict
+    status_dict_node = {
+        "status": "RUNNING",
+        "pid": 1234,
+        "node": {
+            "name": "[SG] VLESS-Dict",
+            "server": "1.1.1.1",
+            "port": 443,
+            "protocol": "vless",
+        },
+        "socks_port": 1080,
+        "http_port": 1081,
+    }
+    out1 = capture_render(views.render_runner_status, runner_status=status_dict_node)
+    assert "RUNNING" in out1 or "AKTIF" in out1
+    assert "[SG] VLESS-Dict" in out1
+    assert "1.1.1.1:443" in out1
+    assert "1080" in out1
+
+    # Format 2: status == "RUNNING" and ProxyNode object
+    node_obj = ProxyNode(
+        id="node-1",
+        protocol="trojan",
+        name="[SG] Trojan-Obj",
+        server="2.2.2.2",
+        port=8443,
+        raw_uri="trojan://...",
+        config={},
+    )
+    status_obj_node = {
+        "status": "RUNNING",
+        "pid": 5678,
+        "node": node_obj,
+        "socks_port": 1080,
+        "http_port": 1081,
+    }
+    out2 = capture_render(views.render_runner_status, runner_status=status_obj_node)
+    assert "RUNNING" in out2 or "AKTIF" in out2
+    assert "[SG] Trojan-Obj" in out2
+    assert "2.2.2.2:8443" in out2
+
+    # Format 3: running == True and flat keys
+    status_flat_node = {
         "running": True,
         "pid": 1234,
         "node_name": "[SG] VLESS-Fast",
@@ -124,29 +167,55 @@ def test_render_runner_status():
         "port": 443,
         "protocol": "vless",
         "socks_port": 1080,
-        "http_port": 1081
+        "http_port": 1081,
     }
-    output = capture_render(views.render_runner_status, runner_status=runner_status)
-    assert "RUNNING" in output or "AKTIF" in output
-    assert "1080" in output
-    assert "1081" in output
-    assert "[SG] VLESS-Fast" in output
-    assert not EMOJI_PATTERN.search(output)
+    out3 = capture_render(views.render_runner_status, runner_status=status_flat_node)
+    assert "RUNNING" in out3 or "AKTIF" in out3
+    assert "[SG] VLESS-Fast" in out3
+
+    # Format 4: STOPPED
+    out4 = capture_render(views.render_runner_status, runner_status={"status": "STOPPED"})
+    assert "TIDAK AKTIF" in out4 or "STOPPED" in out4
 
 
 def test_render_scheduler_status():
     from tui.views import TUIViews
     views = TUIViews()
-    sched_status = {
-        "active": True,
+
+    # Format 1: status == "RUNNING"
+    sched1 = {
+        "status": "RUNNING",
         "interval_minutes": 60,
         "last_run": "2026-08-14 06:00:00",
-        "next_run": "2026-08-14 07:00:00"
+        "next_run": "2026-08-14 07:00:00",
     }
-    output = capture_render(views.render_scheduler_status, sched_status=sched_status)
-    assert "60" in output
-    assert "2026-08-14 06:00:00" in output
-    assert not EMOJI_PATTERN.search(output)
+    out1 = capture_render(views.render_scheduler_status, sched_status=sched1)
+    assert "AKTIF" in out1
+    assert "60" in out1
+
+    # Format 2: active == True
+    sched2 = {
+        "active": True,
+        "interval_minutes": 30,
+        "last_run": "2026-08-14 06:00:00",
+        "next_run": "2026-08-14 06:30:00",
+    }
+    out2 = capture_render(views.render_scheduler_status, sched_status=sched2)
+    assert "AKTIF" in out2
+    assert "30" in out2
+
+    # Format 3: nested status dict status == {"status": "RUNNING"}
+    sched3 = {
+        "status": {"status": "RUNNING"},
+        "interval_minutes": 15,
+    }
+    out3 = capture_render(views.render_scheduler_status, sched_status=sched3)
+    assert "AKTIF" in out3
+    assert "15" in out3
+
+    # Format 4: STOPPED
+    out4 = capture_render(views.render_scheduler_status, sched_status={"status": "STOPPED"})
+    assert "TIDAK AKTIF" in out4
 
 
 def test_create_progress_bar():

@@ -91,6 +91,49 @@ def test_runner_start_failure():
         assert runner.is_running() is False
 
 
+def test_runner_check_port_open():
+    runner = LocalProxyRunner(bin_path="sing-box")
+
+    # Test single arg port
+    with patch("socket.create_connection") as mock_conn:
+        mock_conn.return_value = MagicMock()
+        assert runner._check_port_open(1080) is True
+        mock_conn.assert_called_with(("127.0.0.1", 1080), timeout=0.5)
+
+    # Test host and port args
+    with patch("socket.create_connection") as mock_conn:
+        mock_conn.return_value = MagicMock()
+        assert runner._check_port_open("127.0.0.1", 1080) is True
+        mock_conn.assert_called_with(("127.0.0.1", 1080), timeout=0.5)
+
+    # Test closed port
+    with patch("socket.create_connection", side_effect=OSError("Port closed")):
+        assert runner._check_port_open(1080) is False
+
+
+def test_runner_start_port_check_failure():
+    runner = LocalProxyRunner(bin_path="sing-box")
+    node = ProxyNode(
+        id="4",
+        protocol="vless",
+        name="[SG] Port Fail",
+        server="4.4.4.4",
+        port=443,
+        raw_uri="vless://...",
+        config={"type": "vless"}
+    )
+    mock_proc = MagicMock()
+    mock_proc.poll.return_value = None  # Process claims to be alive
+
+    with patch("subprocess.Popen", return_value=mock_proc), \
+         patch.object(runner, "_check_port_open", return_value=False), \
+         patch("core.binary_manager.BinaryManager.ensure_singbox", return_value="sing-box"):
+
+        started = runner.start(node, socks_port=1080, http_port=1081)
+        assert started is False
+        assert runner.is_running() is False
+
+
 def test_scheduler_lifecycle():
     scheduler = AutoScheduler()
     assert scheduler.is_running() is False

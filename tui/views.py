@@ -171,35 +171,88 @@ class TUIViews:
     ) -> None:
         """Render local proxy runner status dashboard panel."""
         c = console or self.console
-        is_running = runner_status.get("running", False)
+
+        status_val = runner_status.get("status")
+        if isinstance(status_val, dict):
+            status_str = status_val.get("status")
+        else:
+            status_str = status_val
+
+        is_running = (
+            status_str == "RUNNING"
+            or runner_status.get("running") is True
+            or runner_status.get("running") == True
+        )
+
+        node_info = runner_status.get("node")
+        if isinstance(node_info, dict):
+            node_name = (
+                node_info.get("name")
+                or node_info.get("node_name")
+                or runner_status.get("node_name")
+                or "-"
+            )
+            server = node_info.get("server") or runner_status.get("server") or "-"
+            port_val = (
+                node_info.get("port")
+                if node_info.get("port") is not None
+                else runner_status.get("port")
+            )
+            port = str(port_val) if port_val is not None else "-"
+            proto_val = node_info.get("protocol") or runner_status.get("protocol") or "-"
+            protocol = str(proto_val)
+        elif node_info is not None:
+            node_name = (
+                getattr(node_info, "name", None)
+                or runner_status.get("node_name")
+                or "-"
+            )
+            server = getattr(node_info, "server", None) or runner_status.get("server") or "-"
+            port_val = (
+                getattr(node_info, "port", None)
+                if getattr(node_info, "port", None) is not None
+                else runner_status.get("port")
+            )
+            port = str(port_val) if port_val is not None else "-"
+            proto_val = getattr(node_info, "protocol", None) or runner_status.get("protocol") or "-"
+            protocol = str(proto_val)
+        else:
+            node_name = (
+                runner_status.get("node_name")
+                or runner_status.get("name")
+                or "-"
+            )
+            server = runner_status.get("server") or "-"
+            port_val = runner_status.get("port")
+            port = str(port_val) if port_val is not None else "-"
+            proto_val = runner_status.get("protocol") or "-"
+            protocol = str(proto_val)
 
         content = Text()
         if is_running:
             content.append("Status Process    : ", style="bold cyan")
             content.append("[AKTIF / RUNNING]\n", style="bold green")
             content.append("PID               : ", style="bold cyan")
-            content.append(f"{runner_status.get('pid', '-')}\n", style="white")
+            content.append(f"{runner_status.get('pid') or '-'}\n", style="white")
             content.append("Node Aktif        : ", style="bold cyan")
-            content.append(
-                f"{runner_status.get('node_name', '-')}\n", style="bold yellow"
-            )
+            content.append(f"{node_name}\n", style="bold yellow")
             content.append("Target Server     : ", style="bold cyan")
             content.append(
-                f"{runner_status.get('server', '-')}:{runner_status.get('port', '-')}\n",
+                f"{server}:{port}\n",
                 style="white",
             )
             content.append("Protocol          : ", style="bold cyan")
             content.append(
-                f"{str(runner_status.get('protocol', '-')).upper()}\n", style="green"
+                f"{protocol.upper()}\n", style="green"
             )
             content.append("SOCKS5 Inbound    : ", style="bold cyan")
             content.append(
-                f"127.0.0.1:{runner_status.get('socks_port', 1080)}\n",
+                f"127.0.0.1:{runner_status.get('socks_port') or 1080}\n",
                 style="bold green",
             )
             content.append("HTTP Inbound      : ", style="bold cyan")
             content.append(
-                f"127.0.0.1:{runner_status.get('http_port', 1081)}", style="bold green"
+                f"127.0.0.1:{runner_status.get('http_port') or 1081}", style="bold green"
             )
             border = "green"
         else:
@@ -226,7 +279,18 @@ class TUIViews:
     ) -> None:
         """Render scheduler status panel."""
         c = console or self.console
-        is_active = sched_status.get("active", False)
+
+        raw_status = sched_status.get("status")
+        if isinstance(raw_status, dict):
+            status_str = raw_status.get("status")
+        else:
+            status_str = raw_status
+
+        is_active = (
+            status_str == "RUNNING"
+            or sched_status.get("active") is True
+            or sched_status.get("active") == True
+        )
 
         content = Text()
         if is_active:
@@ -234,15 +298,15 @@ class TUIViews:
             content.append("[AKTIF]\n", style="bold green")
             content.append("Interval Auto-Run : ", style="bold cyan")
             content.append(
-                f"{sched_status.get('interval_minutes', 60)} menit\n",
+                f"{sched_status.get('interval_minutes') or 60} menit\n",
                 style="bold yellow",
             )
             content.append("Terakhir Dijalankan: ", style="bold cyan")
             content.append(
-                f"{sched_status.get('last_run', 'Belum Pernah')}\n", style="white"
+                f"{sched_status.get('last_run') or 'Belum Pernah'}\n", style="white"
             )
             content.append("Jadwal Berikutnya : ", style="bold cyan")
-            content.append(f"{sched_status.get('next_run', '-')}", style="white")
+            content.append(f"{sched_status.get('next_run') or '-'}", style="white")
             border = "green"
         else:
             content.append("Status Scheduler  : ", style="bold cyan")
