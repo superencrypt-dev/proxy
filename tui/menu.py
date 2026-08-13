@@ -308,6 +308,7 @@ class TUIMenu:
                     "[4] Direct Paste Link Proxy via Terminal",
                     "[5] Kelola / Hapus Sumber Upstream yang Terdaftar",
                     "[6] Jalankan Health Check pada Seluruh Raw Cache Saat Ini",
+                    "[7] Bersihkan Raw Cache (Hapus Permanen Seluruh Proxy Mati)",
                     "[0] Kembali ke Menu Utama",
                 ],
                 style=questionary.Style([("highlighted", "fg:cyan bold")]),
@@ -328,6 +329,8 @@ class TUIMenu:
                 self._action_manage_sources_list()
             elif choice.startswith("[6]"):
                 self._action_check_raw_cache()
+            elif choice.startswith("[7]"):
+                self._action_purge_dead_raw_cache()
 
             questionary.text("Tekan Enter untuk melanjutkan...").ask()
 
@@ -485,6 +488,29 @@ class TUIMenu:
             return
         self.console.print(f"[bold cyan]Menjalankan Health Check pada {len(raw_nodes)} raw nodes...[/bold cyan]")
         self._run_health_check_pipeline(raw_nodes, is_interactive=True, save_to_active=True)
+
+    def _action_purge_dead_raw_cache(self) -> None:
+        """Purge and permanently delete dead proxies from data/proxies_raw.txt."""
+        raw_nodes = self._load_raw_proxies()
+        if not raw_nodes:
+            self.views.render_status_panel("PERINGATAN", "Database raw proxy masih kosong.", style="yellow")
+            return
+
+        self.console.print(
+            f"[bold cyan]Menjalankan Health Check & Purge Dead Proxies untuk {len(raw_nodes)} raw nodes...[/bold cyan]"
+        )
+        alive_nodes, dead_nodes = self._run_health_check_pipeline(raw_nodes, is_interactive=True, save_to_active=True)
+
+        # Overwrite raw proxies file with only alive nodes (purging all dead nodes)
+        self._save_raw_proxies(alive_nodes, merge_with_existing=False)
+
+        self.views.render_status_panel(
+            "PURGE CACHE SELESAI",
+            f"Pembersihan Database Raw Selesai:\n"
+            f"- {len(dead_nodes)} Proxy Mati telah dihapus secara permanen.\n"
+            f"- {len(alive_nodes)} Proxy Aktif dipertahankan di data/proxies_raw.txt & data/proxies_active.json.",
+            style="green",
+        )
 
     # =========================================================================
     # MENU 3: PROXY EXPLORER & LIVE FILTER (UNIFIED VIEW + FILTER + RUN)
